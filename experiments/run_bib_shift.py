@@ -21,12 +21,10 @@ from utils.sfc_utils import (
     run_evaluation
 )
 
-# Set environment variable to reduce CUDA memory fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 def metric_fn(model, fac_ids, syc_ids):
-    # Computes logit diff between sycophantic and factual tokens
     logits = model.lm_head.output
     last_token_logits = logits[:, -1, :]
     batch_indices = t.arange(last_token_logits.size(0), device=DEVICE)
@@ -39,7 +37,6 @@ def run_experiment(args):
     os.makedirs(EFFECTS_DIR, exist_ok=True)
     tracer_kwargs = dict(scan=False, validate=False)
 
-    # Determine the model name and total layers based on parsed arguments
     if args.model == "gemma":
         model_name = "google/gemma-2-2b"
         total_layers = 26
@@ -58,11 +55,9 @@ def run_experiment(args):
         dtype=DTYPE
     )
 
-    # Freeze all model parameters to save gradient memory overhead
     model.requires_grad_(False)
 
     dataloader = SycophancyDataLoader()
-    # Convert generator to list to reuse the same data across multiple chunks
     batches = list(islice(dataloader.get_text_batches(
         split="train", batch_size=BATCH_SIZE), N_BATCHES))
 
@@ -86,14 +81,10 @@ def run_experiment(args):
 
         chunk_aggregated_effects = {
             submodule.name: 0 for submodule in submodules}
-        submodule_names = [s.name for s in submodules]
 
         for clean, fac_ids, syc_ids in tqdm(batches, desc=f"Scoring L{start_layer}-L{end_layer}"):
-            # We do not use disk cache for raw batch effects anymore!
-            # Raw SAE IG tensors are too massive (hundreds of MBs per batch).
             t.cuda.empty_cache()
 
-            # Execute IG with reduced steps to minimize activation memory footprint
             raw_effects, *_ = patching_effect(
                 clean,
                 None,
@@ -106,18 +97,14 @@ def run_experiment(args):
                 method='ig'
             )
 
-            # Aggregate IMMEDIATELY in memory to reduce dimensional footprint from
-            # [Batch, Seq, Feature] to just [Feature].
             for submodule in submodules:
-                tensor_obj = raw_effects[submodule.name]
+                tensor_obj = raw_effects[submodule]
 
-                # Extract the actual tensor
                 if hasattr(tensor_obj, 'act'):
                     tensor_data = tensor_obj.act
                 else:
                     tensor_data = tensor_obj
 
-                # Dynamically handle different tensor dimensions and accumulate directly
                 if tensor_data.ndim == 3:
                     chunk_aggregated_effects[submodule.name] += (
                         tensor_data[:, 1:, :]
@@ -132,15 +119,12 @@ def run_experiment(args):
                     raise ValueError(
                         f"Unexpected tensor dimension: {tensor_data.ndim}")
 
-            # Delete the massive raw tensor and force garbage collection immediately
             del raw_effects, _
             gc.collect()
             t.cuda.empty_cache()
 
-        # Merge chunk data into the global dictionary
         global_aggregated_effects.update(chunk_aggregated_effects)
 
-        # Forcefully clear VRAM before the next chunk
         del submodules
         del dictionaries
         del chunk_aggregated_effects
@@ -166,7 +150,6 @@ def run_experiment(args):
     feats_to_ablate = generate_ablation_blacklist(
         top_features, TOP_K_TO_ABLATE, num_layers=total_layers)
 
-    # Determine which SAE layers actually need to be reloaded for evaluation
     layers_to_reload = set()
     for submod_name, feats in feats_to_ablate.items():
         if len(feats) > 0 and "_" in submod_name:
@@ -176,40 +159,66 @@ def run_experiment(args):
         print("No features to ablate. Exiting.")
         return
 
-    eval_start_layer = min(layers_to_reload)
-    eval_end_layer = max(layers_to_reload)
+    print("\n--- Starting Chunked Evaluation ---")
 
-    print(
-        f"\nReloading SAEs for evaluation (Layers {eval_start_layer} to {eval_end_layer})...")
-    submodules, dictionaries = load_saes_and_submodules(
-        model,
-        start_layer=eval_start_layer,
-        thru_layer=eval_end_layer,
-        include_embed=False,
-        dtype=DTYPE,
-        device=DEVICE,
-    )
+    # Evaluate features in distinct layer chunks to prevent OOM
+    for start_layer in range(0, total_layers, CHUNK_SIZE):
+        end_layer = min(start_layer + CHUNK_SIZE - 1, total_layers - 1)
 
-    print("Preparing ablation masks...")
-    ablation_masks = prepare_ablation_masks(
-        feats_to_ablate,
-        submodules,
-        dictionaries,
-        DEVICE
-    )
+        # Check if current chunk contains any target layers before loading
+        chunk_has_features = any(
+            layer in layers_to_reload
+            for layer in range(start_layer, end_layer + 1)
+        )
 
-    run_evaluation(
-        model,
-        dataloader,
-        submodules,
-        dictionaries,
-        ablation_masks,
-        tracer_kwargs
-    )
+        if not chunk_has_features:
+            continue
+
+        print(
+            f"\nEvaluating ablation for layers {start_layer} to {end_layer}...")
+
+        # Isolate features that belong strictly to the current chunk
+        chunk_feats_to_ablate = {}
+        for submod_name, feats in feats_to_ablate.items():
+            if "_" in submod_name:
+                layer_idx = int(submod_name.split("_")[1])
+                if start_layer <= layer_idx <= end_layer:
+                    chunk_feats_to_ablate[submod_name] = feats
+
+        submodules, dictionaries = load_saes_and_submodules(
+            model,
+            start_layer=start_layer,
+            thru_layer=end_layer,
+            include_embed=False,
+            dtype=DTYPE,
+            device=DEVICE,
+        )
+
+        ablation_masks = prepare_ablation_masks(
+            chunk_feats_to_ablate,
+            submodules,
+            dictionaries,
+            DEVICE
+        )
+
+        run_evaluation(
+            model,
+            dataloader,
+            submodules,
+            dictionaries,
+            ablation_masks,
+            tracer_kwargs
+        )
+
+        # Force memory clearance after evaluating the chunk
+        del submodules
+        del dictionaries
+        del ablation_masks
+        gc.collect()
+        t.cuda.empty_cache()
 
 
 def main():
-    # Setup argparse to control model selection from the command line
     parser = argparse.ArgumentParser(
         description="Run Feature Circuits Experiment")
     parser.add_argument(
