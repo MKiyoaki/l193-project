@@ -1,5 +1,6 @@
 import os
 import gc
+import json
 import hashlib
 import argparse
 from itertools import islice
@@ -147,44 +148,29 @@ def run_experiment(args):
     top_features.sort(key=lambda x: x[0], reverse=True)
     print_top_features_and_links(top_features)
 
-    feats_to_ablate = generate_ablation_blacklist(
-        top_features, TOP_K_TO_ABLATE, num_layers=total_layers)
+    # Define steps for the completeness curve
+    K_STEPS = [5, 10, 15, 20, 50]
+    completeness_curve_results = {}
 
-    layers_to_reload = set()
-    for submod_name, feats in feats_to_ablate.items():
-        if len(feats) > 0 and "_" in submod_name:
-            layers_to_reload.add(int(submod_name.split("_")[1]))
+    print("\n--- Starting Chunked Completeness Evaluation ---")
 
-    if not layers_to_reload:
-        print("No features to ablate. Exiting.")
-        return
-
-    print("\n--- Starting Chunked Evaluation ---")
-
-    # Evaluate features in distinct layer chunks to prevent OOM
     for start_layer in range(0, total_layers, CHUNK_SIZE):
         end_layer = min(start_layer + CHUNK_SIZE - 1, total_layers - 1)
+        chunk_key = f"L{start_layer}-L{end_layer}"
+        completeness_curve_results[chunk_key] = {}
 
-        # Check if current chunk contains any target layers before loading
-        chunk_has_features = any(
-            layer in layers_to_reload
-            for layer in range(start_layer, end_layer + 1)
+        # Pre-check if there are any features in this chunk for the maximum K
+        max_k_feats = generate_ablation_blacklist(
+            top_features, max(K_STEPS), num_layers=total_layers)
+        chunk_has_features_overall = any(
+            (start_layer <= int(submod.split("_")[1]) <= end_layer)
+            for submod, feats in max_k_feats.items() if len(feats) > 0 and "_" in submod
         )
 
-        if not chunk_has_features:
+        if not chunk_has_features_overall:
             continue
 
-        print(
-            f"\nEvaluating ablation for layers {start_layer} to {end_layer}...")
-
-        # Isolate features that belong strictly to the current chunk
-        chunk_feats_to_ablate = {}
-        for submod_name, feats in feats_to_ablate.items():
-            if "_" in submod_name:
-                layer_idx = int(submod_name.split("_")[1])
-                if start_layer <= layer_idx <= end_layer:
-                    chunk_feats_to_ablate[submod_name] = feats
-
+        print(f"\nReloading SAEs for chunk {chunk_key}...")
         submodules, dictionaries = load_saes_and_submodules(
             model,
             start_layer=start_layer,
@@ -194,28 +180,61 @@ def run_experiment(args):
             device=DEVICE,
         )
 
-        ablation_masks = prepare_ablation_masks(
-            chunk_feats_to_ablate,
-            submodules,
-            dictionaries,
-            DEVICE
-        )
+        for k in K_STEPS:
+            print(f"\nEvaluating Top {k} features for {chunk_key}...")
 
-        run_evaluation(
-            model,
-            dataloader,
-            submodules,
-            dictionaries,
-            ablation_masks,
-            tracer_kwargs
-        )
+            feats_to_ablate_for_k = generate_ablation_blacklist(
+                top_features, k, num_layers=total_layers)
 
-        # Force memory clearance after evaluating the chunk
+            chunk_feats_to_ablate = {}
+            chunk_has_features_for_this_k = False
+            for submod_name, feats in feats_to_ablate_for_k.items():
+                if "_" in submod_name:
+                    layer_idx = int(submod_name.split("_")[1])
+                    if start_layer <= layer_idx <= end_layer:
+                        chunk_feats_to_ablate[submod_name] = feats
+                        if len(feats) > 0:
+                            chunk_has_features_for_this_k = True
+
+            if not chunk_has_features_for_this_k:
+                continue
+
+            ablation_masks = prepare_ablation_masks(
+                chunk_feats_to_ablate,
+                submodules,
+                dictionaries,
+                DEVICE
+            )
+
+            clean_score, ablated_score = run_evaluation(
+                model,
+                dataloader,
+                submodules,
+                dictionaries,
+                ablation_masks,
+                tracer_kwargs
+            )
+
+            completeness_curve_results[chunk_key][k] = ablated_score / 100.0
+
         del submodules
         del dictionaries
         del ablation_masks
         gc.collect()
         t.cuda.empty_cache()
+
+    # Save results to a local JSON file
+    output_data = {
+        "method": "SAE_Features",
+        "data": completeness_curve_results
+    }
+
+    output_path = "sfc_completeness_results.json"
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(output_data, f, indent=4)
+
+    print(
+        f"\nSFC Completeness Curve results successfully saved to {output_path}")
 
 
 def main():
