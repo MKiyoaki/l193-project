@@ -8,6 +8,7 @@ ENV_NAME="sfc"
 export PYTHONPATH="$PROJ_ROOT:$PYTHONPATH"
 
 cd $PROJ_ROOT
-conda run -n $ENV_NAME --no-capture-output python experiments/run_bib_shift.py
+conda run -n $ENV_NAME --no-capture-output python experiments/run_bib_shift.py \
+    --model pythia
     
 cd $SCRIPT_DIR

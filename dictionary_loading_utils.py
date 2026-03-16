@@ -10,11 +10,13 @@ import os
 
 DICT_DIR = os.path.dirname(os.path.abspath(__file__)) + "/dictionaries"
 
-DictionaryStash = namedtuple("DictionaryStash", ["embed", "attns", "mlps", "resids"])
+DictionaryStash = namedtuple(
+    "DictionaryStash", ["embed", "attns", "mlps", "resids"])
 
 
 def _load_pythia_saes_and_submodules(
     model,
+    start_layer: int = 0,
     thru_layer: int | None = None,
     separate_by_type: bool = False,
     include_embed: bool = True,
@@ -26,13 +28,15 @@ def _load_pythia_saes_and_submodules(
         len(model.gpt_neox.layers) == 6
     ), "Not the expected number of layers for pythia-70m-deduped"
     if thru_layer is None:
-        thru_layer = len(model.gpt_neox.layers)
+        thru_layer = len(model.gpt_neox.layers) - 1
 
     attns = []
     mlps = []
     resids = []
     dictionaries = {}
-    if include_embed:
+
+    # Only load embeddings if we are starting from the very beginning
+    if include_embed and start_layer == 0:
         embed = Submodule(
             name="embed",
             submodule=model.gpt_neox.embed_in,
@@ -47,7 +51,10 @@ def _load_pythia_saes_and_submodules(
             dictionaries[embed] = IdentityDict(512, device=device, dtype=dtype)
     else:
         embed = None
-    for i, layer in enumerate(model.gpt_neox.layers[: thru_layer + 1]):
+
+    # Iterate only through the specified layer range to save VRAM
+    for i in range(start_layer, thru_layer + 1):
+        layer = model.gpt_neox.layers[i]
         attns.append(
             attn := Submodule(
                 name=f"attn_{i}",
@@ -92,7 +99,7 @@ def _load_pythia_saes_and_submodules(
     if separate_by_type:
         return DictionaryStash(embed, attns, mlps, resids), dictionaries
     else:
-        submodules = ([embed] if include_embed else []) + [
+        submodules = ([embed] if embed else []) + [
             x
             for layer_dictionaries in zip(attns, mlps, resids)
             for x in layer_dictionaries
@@ -142,6 +149,7 @@ def load_gemma_sae(
 
 def _load_gemma_saes_and_submodules(
     model,
+    start_layer: int = 0,
     thru_layer: int | None = None,
     separate_by_type: bool = False,
     include_embed: bool = True,
@@ -153,13 +161,15 @@ def _load_gemma_saes_and_submodules(
         len(model.model.layers) == 26
     ), "Not the expected number of layers for Gemma-2-2B"
     if thru_layer is None:
-        thru_layer = len(model.model.layers)
+        thru_layer = len(model.model.layers) - 1
 
     attns = []
     mlps = []
     resids = []
     dictionaries = {}
-    if include_embed:
+
+    # Only load embedding SAE if explicitly requested and starting from layer 0
+    if include_embed and start_layer == 0:
         embed = Submodule(
             name="embed",
             submodule=model.model.embed_tokens,
@@ -169,11 +179,14 @@ def _load_gemma_saes_and_submodules(
         )
     else:
         embed = None
-    for i, layer in tqdm(
-        enumerate(model.model.layers[: thru_layer + 1]),
-        total=thru_layer + 1,
-        desc="Loading Gemma SAEs",
+
+    # Iterate only through the specified layer range to prevent OOM
+    for i in tqdm(
+        range(start_layer, thru_layer + 1),
+        desc=f"Loading Gemma SAEs (Layers {start_layer}-{thru_layer})",
     ):
+        layer = model.model.layers[i]
+
         attns.append(
             attn := Submodule(
                 name=f"attn_{i}", submodule=layer.self_attn.o_proj, use_input=True
@@ -205,7 +218,7 @@ def _load_gemma_saes_and_submodules(
     if separate_by_type:
         return DictionaryStash(embed, attns, mlps, resids), dictionaries
     else:
-        submodules = ([embed] if include_embed else []) + [
+        submodules = ([embed] if embed else []) + [
             x
             for layer_dictionaries in zip(attns, mlps, resids)
             for x in layer_dictionaries
@@ -215,6 +228,7 @@ def _load_gemma_saes_and_submodules(
 
 def load_saes_and_submodules(
     model,
+    start_layer: int = 0,
     thru_layer: int | None = None,
     separate_by_type: bool = False,
     include_embed: bool = True,
@@ -227,6 +241,7 @@ def load_saes_and_submodules(
     if model_name == "EleutherAI/pythia-70m-deduped":
         return _load_pythia_saes_and_submodules(
             model,
+            start_layer=start_layer,
             thru_layer=thru_layer,
             separate_by_type=separate_by_type,
             include_embed=include_embed,
@@ -237,6 +252,7 @@ def load_saes_and_submodules(
     elif model_name == "google/gemma-2-2b":
         return _load_gemma_saes_and_submodules(
             model,
+            start_layer=start_layer,
             thru_layer=thru_layer,
             separate_by_type=separate_by_type,
             include_embed=include_embed,

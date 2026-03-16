@@ -89,7 +89,8 @@ def evaluate_with_ablations(text_batches, model, submodules, dictionaries, ablat
                     x_hat, f = dictionary(x, output_features=True)
                     res = x - x_hat
 
-                    f[:, :, feat_mask] = 0.0
+                    # Use ellipsis to handle dynamic dimensions dynamically
+                    f[..., feat_mask] = 0.0
 
                     submodule.set_activation(dictionary.decode(f) + res)
 
