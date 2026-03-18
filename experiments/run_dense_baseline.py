@@ -9,6 +9,10 @@ from tqdm import tqdm
 from nnsight import LanguageModel
 from attribution import patching_effect
 from dictionary_loading_utils import load_saes_and_submodules
+from pathlib import Path
+
+from utils.sfc_utils import save_extracted_features_to_json
+from utils.data_utils import get_dataset_path
 from utils.data_loader import SycophancyDataLoader
 from utils.configs_utils import (
     DTYPE, DEVICE, BATCH_SIZE, N_BATCHES, EFFECTS_DIR
@@ -35,11 +39,11 @@ class IdentityDict(nn.Module):
         return x
 
     def decode(self, f):
-        # Identity mapping: features are the same as activations
         return f
 
 
 def metric_fn(model, fac_ids, syc_ids):
+    """Compute difference between sycophantic and factual logits."""
     logits = model.lm_head.output
     last_token_logits = logits[:, -1, :]
     batch_indices = t.arange(last_token_logits.size(0), device=DEVICE)
@@ -49,9 +53,7 @@ def metric_fn(model, fac_ids, syc_ids):
 
 
 def get_submodules(model, start_layer, end_layer):
-    """
-    Retrieves the actual residual stream / MLP submodule objects for the dense model.
-    """
+    """Retrieve residual stream and MLP submodules for the dense model."""
     submodules = []
     for layer_idx in range(start_layer, end_layer + 1):
         res_submod = model.model.layers[layer_idx]
@@ -65,57 +67,54 @@ def get_submodules(model, start_layer, end_layer):
     return submodules
 
 
-def evaluate_completeness_curve(
+def evaluate_completeness_thresholds(
     model,
     dataloader,
     submodules,
-    ranked_neurons,
-    k_steps,
+    global_aggregated_effects,
+    thresholds,
     d_model,
     device,
     tracer_kwargs
 ):
-    """
-    Evaluates sycophancy rate using mean ablation via out-of-place math.
-    """
-    # Materialize dataloader once to prevent iterator exhaustion
+    """Evaluate sycophancy rate using mean ablation via out-of-place math based on effect thresholds."""
     batches = list(dataloader)
-
     curve_results = {}
 
-    for k in k_steps:
-        print(f"\nEvaluating mean ablation for Top {k} Neurons...")
-        current_top_k = ranked_neurons[:k]
+    for thresh in thresholds:
+        print(f"\nEvaluating mean ablation for Threshold > {thresh}...")
 
-        ablation_masks = {}
+        ablation_masks = {
+            submod.name: t.zeros(d_model, dtype=t.float32, device=device)
+            for submod in submodules
+        }
+        num_neurons_ablated = 0
+
         for submod in submodules:
-            ablation_masks[submod.name] = t.zeros(
-                d_model, dtype=t.float32, device=device
-            )
+            effects = global_aggregated_effects[submod.name]
+            ablate_indices = t.where(effects > thresh)[0]
+            num_features = len(ablate_indices)
 
-        for _, submod_name, idx in current_top_k:
-            if submod_name in ablation_masks:
-                ablation_masks[submod_name][idx] = 1.0
+            if num_features > 0:
+                ablation_masks[submod.name][ablate_indices] = 1.0
+                num_neurons_ablated += num_features
+
+        if num_neurons_ablated == 0:
+            print(f"No neurons found above threshold {thresh}. Skipping.")
+            continue
 
         syc_logits_list = []
         fac_logits_list = []
 
-        with tqdm(total=len(batches), desc=f"Top {k} Eval") as pbar:
+        with tqdm(total=len(batches), desc=f"Eval ({num_neurons_ablated} neurons)") as pbar:
             for text_batch, fac_ids, syc_ids in batches:
-
-                # Defensively align index tensors to target device
                 fac_ids_dev = fac_ids.to(device)
                 syc_ids_dev = syc_ids.to(device)
 
                 with model.trace(text_batch, **tracer_kwargs):
-
                     for submod in submodules:
-                        # Extract proxy safely without strict string/tuple checks
-                        # Gemma's residual layers return a tuple, MLPs return a tensor
                         output_proxy = submod.output
 
-                        # Use .shape to infer if we need to index [0]
-                        # Tensors have .shape, tuples don't
                         if hasattr(output_proxy, "shape"):
                             act = output_proxy
                             is_tuple = False
@@ -143,25 +142,26 @@ def evaluate_completeness_curve(
                     f_proxy = last_token_logits[batch_indices, fac_ids_dev].save(
                     )
 
-                # Extract values to CPU immediately after trace context
                 syc_logits_list.append(s_proxy.value.detach().cpu())
                 fac_logits_list.append(f_proxy.value.detach().cpu())
-
                 pbar.update(1)
 
         all_syc = t.cat(syc_logits_list)
         all_fac = t.cat(fac_logits_list)
 
         syc_rate = (all_syc > all_fac).float().mean().item()
-        curve_results[k] = syc_rate
-        print(f"Result for Top {k}: Sycophancy Rate = {syc_rate:.4%}")
+        curve_results[num_neurons_ablated] = syc_rate
+        print(
+            f"Result for Threshold {thresh} ({num_neurons_ablated} Neurons Ablated): Sycophancy Rate = {syc_rate:.4%}")
 
     return curve_results
 
 
 def run_dense_experiment(args):
+    """Main execution pipeline for dense baseline experiment."""
     os.makedirs(EFFECTS_DIR, exist_ok=True)
     tracer_kwargs = dict(scan=False, validate=False)
+    thresholds = args.thresholds
 
     model_name = "google/gemma-2-2b"
     total_layers = 26
@@ -177,7 +177,9 @@ def run_dense_experiment(args):
     )
     model.requires_grad_(False)
 
-    dataloader = SycophancyDataLoader()
+    dataloader = SycophancyDataLoader(
+        file_path=get_dataset_path(args.experiment_name)
+    )
     batches = list(islice(dataloader.get_text_batches(
         split="train", batch_size=BATCH_SIZE), N_BATCHES))
 
@@ -205,31 +207,18 @@ def run_dense_experiment(args):
             t.cuda.empty_cache()
 
             raw_effects, *_ = patching_effect(
-                clean,
-                None,
-                model,
-                submodules,
-                dictionaries,
-                metric_fn,
-                steps=5,
-                metric_kwargs=dict(fac_ids=fac_ids, syc_ids=syc_ids),
-                method='ig'
+                clean, None, model, submodules, dictionaries, metric_fn,
+                steps=5, metric_kwargs=dict(fac_ids=fac_ids, syc_ids=syc_ids), method='ig'
             )
 
             for submodule in submodules:
                 tensor_obj = raw_effects[submodule]
+                tensor_data = tensor_obj.act if hasattr(
+                    tensor_obj, 'act') else tensor_obj
 
-                # CRITICAL FIX: Extract the raw tensor from SparseAct wrapper
-                if hasattr(tensor_obj, 'act'):
-                    tensor_data = tensor_obj.act
-                else:
-                    tensor_data = tensor_obj
-
-                # Now tensor_data is a torch.Tensor and has .ndim
                 if tensor_data.ndim == 3:
                     chunk_aggregated_effects[submodule.name] += (
-                        tensor_data[:, 1:, :]
-                    ).sum(dim=1).sum(dim=0).to("cpu")
+                        tensor_data[:, 1:, :]).sum(dim=1).sum(dim=0).to("cpu")
                 elif tensor_data.ndim == 2:
                     chunk_aggregated_effects[submodule.name] += tensor_data.sum(
                         dim=0).to("cpu")
@@ -245,52 +234,45 @@ def run_dense_experiment(args):
         gc.collect()
 
     total_examples = BATCH_SIZE * N_BATCHES
-    global_aggregated_effects = {
-        k: v / total_examples for k, v in global_aggregated_effects.items()
-    }
+    for k in global_aggregated_effects:
+        global_aggregated_effects[k] /= total_examples
 
-    print("\nExtracting Global Top Dense Neurons...")
-    top_neurons = []
-    for submod_name, effects_tensor in global_aggregated_effects.items():
-        top_vals, top_idxs = t.topk(effects_tensor, k=10)
-        for val, idx in zip(top_vals, top_idxs):
-            if val > 0:
-                top_neurons.append((val.item(), submod_name, idx.item()))
+    min_eval_thresh = min(thresholds)
+    dense_neurons_path = Path(
+        EFFECTS_DIR
+    ) / f"extracted_dense_neurons_{args.experiment_name}.json"
 
-    top_neurons.sort(key=lambda x: x[0], reverse=True)
-
-    K_STEPS = [5, 10, 15, 20, 50]
+    save_extracted_features_to_json(
+        global_aggregated_effects=global_aggregated_effects,
+        output_path=dense_neurons_path,
+        min_threshold=min_eval_thresh
+    )
 
     print("\n--- Starting Dense Neuron Completeness Evaluation ---")
 
     eval_batches = islice(dataloader.get_text_batches(
         split="test", batch_size=BATCH_SIZE), N_BATCHES)
 
-    # Fetch ALL submodules across the network for full evaluation masking
     all_submodules = get_submodules(model, 0, total_layers - 1)
 
-    curve_results = evaluate_completeness_curve(
+    curve_results = evaluate_completeness_thresholds(
         model=model,
         dataloader=eval_batches,
         submodules=all_submodules,
-        ranked_neurons=top_neurons,
-        k_steps=K_STEPS,
+        global_aggregated_effects=global_aggregated_effects,
+        thresholds=thresholds,
         d_model=d_model,
         device=DEVICE,
         tracer_kwargs=tracer_kwargs
     )
 
-    print("\n--- Final Dense Completeness Curve Results ---")
-    for k, rate in curve_results.items():
-        print(f"Top {k} Neurons Ablated -> Sycophancy Rate: {rate:.4%}")
-
-    # Save results to a local JSON file
     output_data = {
-        "method": "Dense_Neurons",
+        "method": "Dense_Neurons_Threshold",
         "data": curve_results
     }
 
-    output_path = "dense_completeness_results.json"
+    output_path = Path(EFFECTS_DIR) / \
+        f"dense_completeness_results_{args.experiment_name}.json"
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(output_data, f, indent=4)
 
@@ -301,6 +283,19 @@ def run_dense_experiment(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="gemma")
+    parser.add_argument(
+        "--thresholds",
+        nargs="+",
+        type=float,
+        default=[0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001],
+        help="List of thresholds to evaluate dense neuron completeness."
+    )
+    parser.add_argument(
+        "--experiment_name",
+        type=str,
+        choices=["nlp", "phi", "political"],
+        default="nlp",
+    )
     args = parser.parse_args()
     run_dense_experiment(args)
 

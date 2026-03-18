@@ -1,4 +1,6 @@
 import torch as t
+import json
+from pathlib import Path
 from tqdm import tqdm
 
 
@@ -114,7 +116,7 @@ def run_evaluation(model, dataloader, submodules, dictionaries, ablation_masks, 
     Runs evaluation on the test set, comparing clean performance vs ablated performance.
     """
     print("\n--- Running Final Evaluation ---")
-    test_batches = dataloader.get_text_batches(split="test", batch_size=16)
+    test_batches = dataloader.get_text_batches(split="test", batch_size=8)
 
     clean_diffs = []
     print("Evaluating Clean Model...")
@@ -155,3 +157,72 @@ def run_evaluation(model, dataloader, submodules, dictionaries, ablation_masks, 
     print("="*50)
 
     return clean_score, ablated_score
+
+
+def save_extracted_features_to_json(global_aggregated_effects, output_path, min_threshold=0.0, global_mean_activations=None):
+    """
+    Extracts features/neurons with an absolute effect size greater than min_threshold,
+    sorts them by absolute effect, and saves them to a JSON file.
+    Supports bidirectional extraction (promoters vs. suppressors) and optional mean activation tracking.
+
+    Args:
+        global_aggregated_effects (dict): Dictionary mapping submodule names to their effect tensors.
+        output_path (str): The local file path to save the JSON data.
+        min_threshold (float): Features with absolute effect strictly greater than this will be saved.
+        global_mean_activations (dict, optional): Dictionary mapping submodule names to mean activation tensors.
+    """
+    extracted_items = []
+
+    for submod_name, effects_tensor in global_aggregated_effects.items():
+        # Find indices where the absolute effect exceeds the minimum threshold
+        valid_indices = t.where(effects_tensor.abs() > min_threshold)[0]
+
+        for idx in valid_indices:
+            val = effects_tensor[idx].item()
+
+            # Determine the semantic type of the feature
+            feature_type = "sycophancy_promoter" if val > 0 else "factuality_promoter"
+
+            item_data = {
+                "submodule": submod_name,
+                "index": idx.item(),
+                "effect": val,
+                "abs_effect": abs(val),
+                "type": feature_type
+            }
+
+            # Log mean activations if provided
+            if global_mean_activations is not None and submod_name in global_mean_activations:
+                mean_act_tensor = global_mean_activations[submod_name]
+                item_data["mean_activation"] = mean_act_tensor[idx].item()
+
+            extracted_items.append(item_data)
+
+    # Sort globally by absolute effect size in descending order
+    extracted_items.sort(key=lambda x: x["abs_effect"], reverse=True)
+
+    # Count the two types for metadata
+    syc_count = sum(
+        1 for x in extracted_items if x["type"] == "sycophancy_promoter")
+    fac_count = sum(
+        1 for x in extracted_items if x["type"] == "factuality_promoter")
+
+    output_data = {
+        "metadata": {
+            "min_threshold_applied": min_threshold,
+            "total_items_saved": len(extracted_items),
+            "sycophancy_promoters": syc_count,
+            "factuality_promoters": fac_count,
+            "contains_mean_activations": global_mean_activations is not None
+        },
+        "ranked_features": extracted_items
+    }
+
+    # Ensure the directory exists
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(output_data, f, indent=4)
+
+    print(
+        f"\n[Storage] Successfully saved {len(extracted_items)} features ({syc_count} Sycophancy, {fac_count} Factuality) to {output_path}")

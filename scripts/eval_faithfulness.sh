@@ -9,6 +9,6 @@ export PYTHONPATH="$PROJ_ROOT:$PYTHONPATH"
 
 cd $PROJ_ROOT
 conda run -n $ENV_NAME --no-capture-output python experiments/eval_faithfulness.py \
-    --model gemma
+    --experiment_name nlp
     
 cd $SCRIPT_DIR
