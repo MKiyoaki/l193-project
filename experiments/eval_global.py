@@ -128,16 +128,16 @@ def main():
     empty_masks = prepare_ablation_masks(empty_indices, all_submodules, all_dictionaries, DEVICE)
 
     with t.no_grad():
-        _, clean_score = run_evaluation(
+        _, clean_score, _ = run_evaluation(
             model, dataloader, all_submodules, all_dictionaries, empty_masks, 
-            tracer_kwargs, batch_size=2, complement=True
+            tracer_kwargs, batch_size=4, complement=True
         )
     print(f"Clean Model Score: {clean_score:.4f}")
 
     with t.no_grad():
-        _, empty_score = run_evaluation(
+        _, empty_score, _ = run_evaluation(
             model, dataloader, all_submodules, all_dictionaries, empty_masks, 
-            tracer_kwargs, batch_size=2, complement=False
+            tracer_kwargs, batch_size=4, complement=False
         )
     print(f"Empty Model Score: {empty_score:.4f}")
 
@@ -169,17 +169,17 @@ def main():
         circuit_masks = prepare_ablation_masks(circuit_indices, all_submodules, all_dictionaries, DEVICE)
         
         with t.no_grad():
-            _, comp_syc = run_evaluation(
+            _, comp_syc, _ = run_evaluation(
                 model, dataloader, all_submodules, all_dictionaries, circuit_masks, 
-                tracer_kwargs, batch_size=2, complement=True
+                tracer_kwargs, batch_size=4, complement=True
             )
         completeness_results[n_nodes] = comp_syc
         print(f"  -> Completeness: {completeness_results[n_nodes]:.4f}")
 
         with t.no_grad():
-            _, faith_syc = run_evaluation(
+            _, faith_syc, _ = run_evaluation(
                 model, dataloader, all_submodules, all_dictionaries, circuit_masks, 
-                tracer_kwargs, batch_size=2, complement=False
+                tracer_kwargs, batch_size=4, complement=False
             )
         faithfulness_raw[n_nodes] = faith_syc
         print(f"  -> Faithfulness: {faithfulness_raw[n_nodes]:.4f}")

@@ -13,9 +13,9 @@ conda run -n $ENV_NAME --no-capture-output python experiments/eval_global.py \
     --method sfc \
     --experiment_name nlp
 
-echo "Starting Global Evaluation for Dense Neurons (Baseline)..."
-conda run -n $ENV_NAME --no-capture-output python experiments/eval_global.py \
-    --method dense \
-    --experiment_name nlp
+# echo "Starting Global Evaluation for Dense Neurons (Baseline)..."
+# conda run -n $ENV_NAME --no-capture-output python experiments/eval_global.py \
+#     --method dense \
+#     --experiment_name nlp
     
 cd $SCRIPT_DIR
