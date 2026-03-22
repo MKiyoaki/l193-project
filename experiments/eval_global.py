@@ -1,8 +1,9 @@
+# experiments/eval_global.py
+
 import os
 import gc
 import json
 import argparse
-from collections import defaultdict
 import torch as t
 from torch import nn
 from nnsight import LanguageModel
@@ -11,16 +12,14 @@ from pathlib import Path
 from dictionary_loading_utils import load_saes_and_submodules
 from utils.data_utils import get_dataset_path
 from utils.data_loader import SycophancyDataLoader
-from utils.configs_utils import DTYPE, DEVICE, N_BATCHES, EFFECTS_DIR
+from utils.configs_utils import DTYPE, DEVICE, EFFECTS_DIR
 from utils.sfc_utils import prepare_ablation_masks, run_evaluation
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-
 class IdentityDict(nn.Module):
     """
     Dummy dictionary for Dense baseline.
-    Updated to accept output_features and arbitrary kwargs.
     """
     def __init__(self, d_model):
         super().__init__()
@@ -38,11 +37,9 @@ class IdentityDict(nn.Module):
     def decode(self, f): 
         return f
 
-
 def patch_dense_submodule(submod):
     """
-    Injects get_activation and set_activation to standard PyTorch modules 
-    for sfc_utils compatibility. Handles tuple outputs for models like Gemma.
+    Injects get_activation and set_activation.
     """
     def get_act():
         out = submod.output
@@ -58,36 +55,36 @@ def patch_dense_submodule(submod):
     submod.get_activation = get_act
     submod.set_activation = set_act
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="gemma")
     parser.add_argument("--experiment_name", type=str, default="nlp")
     parser.add_argument("--method", type=str, choices=["sfc", "dense"], required=True)
+    parser.add_argument(
+        "--thresholds", 
+        type=float, 
+        nargs="+", 
+        default=[2.0, 1.0, 0.5, 0.2, 0.1, 0.05, 0.01, 0.005],
+        help="List of absolute effect thresholds for defining the circuit."
+    )
     args = parser.parse_args()
 
-    if args.method == "sfc":
-        k_steps = [0, 10, 50, 100, 300, 500, 1000, 2000, 5000]
-        json_prefix = "extracted_sfc_features"
-    else:
-        k_steps = [0, 100, 500, 1000, 5000, 10000, 20000, 50000]
-        json_prefix = "extracted_dense_neurons"
-
+    json_prefix = "extracted_sfc_features" if args.method == "sfc" else "extracted_dense_neurons"
     json_path = Path(EFFECTS_DIR) / f"{json_prefix}_{args.experiment_name}.json"
+    
     if not json_path.exists():
         raise FileNotFoundError(f"Missing extracted features file: {json_path}")
 
     with open(json_path, 'r') as f:
         extracted_data = json.load(f)
 
-    syc_promoters = [feat for feat in extracted_data["ranked_features"] if feat.get("type") == "sycophancy_promoter"]
-
-    print(f"Loading Model: gemma-2-2b for {args.method.upper()} Global Evaluation...")
-    model = LanguageModel("google/gemma-2-2b", device_map=DEVICE, dispatch=True, attn_implementation="eager", dtype=DTYPE)
+    print(f"Loading Model: {args.model} for {args.method.upper()} Global Evaluation...")
+    model_id = "google/gemma-2-2b" if "gemma" in args.model.lower() else "EleutherAI/pythia-70m-deduped"
+    model = LanguageModel(model_id, device_map=DEVICE, dispatch=True, attn_implementation="eager", dtype=DTYPE)
     model.requires_grad_(False)
 
-    total_layers = 26
-    d_model = 2304
+    total_layers = 26 if "gemma" in args.model.lower() else 6
+    d_model = 2304 if "gemma" in args.model.lower() else 512
 
     print("Loading SAEs/Dictionaries globally (Weights only)...")
     if args.method == "sfc":
@@ -98,91 +95,110 @@ def main():
         all_submodules = []
         all_dictionaries = {}
         for l in range(total_layers):
-            res_submod = model.model.layers[l]
+            res_submod = model.model.layers[l] if hasattr(model.model, 'layers') else model.gpt_neox.layers[l]
             res_submod.name = f"resid_{l}"
             patch_dense_submodule(res_submod)
             all_submodules.append(res_submod)
             all_dictionaries[res_submod] = IdentityDict(d_model).to(DEVICE).to(DTYPE)
 
-            mlp_submod = model.model.layers[l].mlp
+            mlp_submod = res_submod.mlp
             mlp_submod.name = f"mlp_{l}"
             patch_dense_submodule(mlp_submod)
             all_submodules.append(mlp_submod)
             all_dictionaries[mlp_submod] = IdentityDict(d_model).to(DEVICE).to(DTYPE)
 
-    # Move ALL dictionaries to CPU immediately to free VRAM for clean model bound computation
-    for dict_module in all_dictionaries.values():
-        dict_module.to("cpu")
-    t.cuda.empty_cache()
+    start_layer = 8 if "gemma" in args.model.lower() else 2
+    all_submodules = [s for s in all_submodules if int(s.name.split('_')[-1]) >= start_layer]
+    valid_submod_names = set([s.name for s in all_submodules])
+
+    circuit_nodes = [
+        feat for feat in extracted_data["ranked_features"] 
+        if feat["submodule"] in valid_submod_names
+    ]
 
     dataloader = SycophancyDataLoader(file_path=get_dataset_path(args.experiment_name))
     tracer_kwargs = dict(scan=False, validate=False)
 
-    completeness_results = {}
-    faithfulness_raw = {}
+    print("\n--- Establishing Base Metrics ---")
+    for s in all_submodules:
+        all_dictionaries[s].to(DEVICE)
+    t.cuda.empty_cache()
 
-    print("\n--- Computing Clean Model Bound ---")
+    empty_indices = {s.name: [] for s in all_submodules}
+    empty_masks = prepare_ablation_masks(empty_indices, all_submodules, all_dictionaries, DEVICE)
+
     with t.no_grad():
-        clean_syc, _ = run_evaluation(model, dataloader, [], {}, {}, tracer_kwargs)
-    clean_score = clean_syc / 100.0
-    print(f"Clean Model Score: {clean_score:.2%}")
+        _, clean_score = run_evaluation(
+            model, dataloader, all_submodules, all_dictionaries, empty_masks, 
+            tracer_kwargs, batch_size=2, complement=True
+        )
+    print(f"Clean Model Score: {clean_score:.4f}")
 
-    for k in k_steps:
-        print(f"\n[Evaluating Global Top {k} Nodes]")
-        if k == 0:
-            completeness_results[k] = clean_score
+    with t.no_grad():
+        _, empty_score = run_evaluation(
+            model, dataloader, all_submodules, all_dictionaries, empty_masks, 
+            tracer_kwargs, batch_size=2, complement=False
+        )
+    print(f"Empty Model Score: {empty_score:.4f}")
+
+    for s in all_submodules:
+        all_dictionaries[s].to("cpu")
+    del empty_masks
+    gc.collect()
+    t.cuda.empty_cache()
+
+    completeness_results = {0: clean_score}
+    faithfulness_raw = {0: empty_score}
+
+    for threshold in sorted(args.thresholds, reverse=True):
+        current_circuit = [feat for feat in circuit_nodes if feat["abs_effect"] >= threshold]
+        n_nodes = len(current_circuit)
+        
+        print(f"\n[Evaluating Threshold {threshold} | Nodes in Circuit: {n_nodes}]")
+        if n_nodes == 0:
             continue
 
-        current_top_k = syc_promoters[:k]
-        top_k_map = defaultdict(set)
-        for feat in current_top_k:
-            top_k_map[feat["submodule"]].add(feat["index"])
+        circuit_indices = {s.name: [] for s in all_submodules}
+        for feat in current_circuit:
+            circuit_indices[feat["submodule"]].append(feat["index"])
 
-        active_submodules = [s for s in all_submodules if s.name in top_k_map]
-        active_dictionaries = {s: all_dictionaries[s] for s in active_submodules}
-        
-        # Move ONLY the active dictionaries for this step back to GPU
-        for s in active_submodules:
-            active_dictionaries[s].to(DEVICE)
-            
+        for s in all_submodules:
+            all_dictionaries[s].to(DEVICE)
         t.cuda.empty_cache()
 
-        # Metric 1: Completeness
-        feats_to_ablate_comp = {s.name: list(top_k_map[s.name]) for s in active_submodules}
-        comp_masks = prepare_ablation_masks(feats_to_ablate_comp, active_submodules, active_dictionaries, DEVICE)
+        circuit_masks = prepare_ablation_masks(circuit_indices, all_submodules, all_dictionaries, DEVICE)
         
         with t.no_grad():
-            _, comp_syc = run_evaluation(model, dataloader, active_submodules, active_dictionaries, comp_masks, tracer_kwargs)
-        completeness_results[k] = comp_syc / 100.0
-        print(f"  -> Completeness (Ablate {k}): {completeness_results[k]:.2%}")
+            _, comp_syc = run_evaluation(
+                model, dataloader, all_submodules, all_dictionaries, circuit_masks, 
+                tracer_kwargs, batch_size=2, complement=True
+            )
+        completeness_results[n_nodes] = comp_syc
+        print(f"  -> Completeness: {completeness_results[n_nodes]:.4f}")
 
-        # Metric 2: Faithfulness
-        feats_to_ablate_faith = {}
-        for s in active_submodules:
-            dict_size = active_dictionaries[s].dict_size
-            all_indices = set(range(dict_size))
-            keep_indices = top_k_map[s.name]
-            feats_to_ablate_faith[s.name] = list(all_indices - keep_indices)
-
-        faith_masks = prepare_ablation_masks(feats_to_ablate_faith, active_submodules, active_dictionaries, DEVICE)
-        
         with t.no_grad():
-            _, faith_syc = run_evaluation(model, dataloader, active_submodules, active_dictionaries, faith_masks, tracer_kwargs)
-        faithfulness_raw[k] = faith_syc / 100.0
-        print(f"  -> Faithfulness (Keep {k}, Ablate rest in active layers): {faithfulness_raw[k]:.2%}")
+            _, faith_syc = run_evaluation(
+                model, dataloader, all_submodules, all_dictionaries, circuit_masks, 
+                tracer_kwargs, batch_size=2, complement=False
+            )
+        faithfulness_raw[n_nodes] = faith_syc
+        print(f"  -> Faithfulness: {faithfulness_raw[n_nodes]:.4f}")
 
-        # Move active dictionaries back to CPU to prevent VRAM accumulation
-        for s in active_submodules:
-            active_dictionaries[s].to("cpu")
-
-        # Aggressive memory clearing
-        del comp_masks, faith_masks
+        for s in all_submodules:
+            all_dictionaries[s].to("cpu")
+        
+        del circuit_masks
         gc.collect()
         t.cuda.empty_cache()
 
     comp_output = Path(EFFECTS_DIR) / f"global_completeness_{args.method}_{args.experiment_name}.json"
     with open(comp_output, 'w') as f:
-        json.dump({"method": args.method.upper(), "experiment": args.experiment_name, "data": completeness_results}, f, indent=4)
+        json.dump({
+            "method": args.method.upper(), 
+            "experiment": args.experiment_name, 
+            "data": completeness_results,
+            "metadata": {"clean_score": clean_score, "empty_score": empty_score}
+        }, f, indent=4)
 
     faith_output = Path(EFFECTS_DIR) / f"global_faithfulness_{args.method}_{args.experiment_name}.json"
     with open(faith_output, 'w') as f:
@@ -190,11 +206,10 @@ def main():
             "method": args.method.upper(),
             "experiment": args.experiment_name,
             "data": faithfulness_raw,
-            "metadata": {"clean_score": clean_score}
+            "metadata": {"clean_score": clean_score, "empty_score": empty_score}
         }, f, indent=4)
 
     print(f"\nAll Global Metrics successfully saved to {EFFECTS_DIR}!")
-
 
 if __name__ == "__main__":
     main()

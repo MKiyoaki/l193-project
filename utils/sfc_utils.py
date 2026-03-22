@@ -71,28 +71,44 @@ def prepare_ablation_masks(feats_to_ablate, submodules, dictionaries, device):
     return masks
 
 
-@t.no_grad()
-def evaluate_with_ablations(text_batches, model, submodules, dictionaries, ablation_masks, tracer_kwargs):
+def calculate_sycophancy_score(logits_diffs):
     """
-    Traces the model forward pass, zero-ablates specified SAE features, 
-    and yields the final token logits for evaluation.
+    Calculates the continuous mean logit difference.
+    Matches the official metric calculation.
+    """
+    diffs = t.cat(logits_diffs)
+    return diffs.mean().item()
+
+@t.no_grad()
+def evaluate_with_ablations(text_batches, model, submodules, dictionaries, ablation_masks, tracer_kwargs, complement=False):
+    """
+    Traces the model forward pass, ablates specified features, and yields final token logits.
+    Applies zero-ablation for SAE features and mean-ablation for Dense baseline neurons.
+    Handles reconstruction errors appropriately based on the evaluation mode.
     """
     with tqdm(total=len(text_batches), desc="Evaluating with ablations") as pbar:
         for text_batch, fac_ids, syc_ids in text_batches:
             with model.trace(text_batch, **tracer_kwargs):
                 for submodule in submodules:
                     dictionary = dictionaries[submodule]
-                    feat_mask = ablation_masks[submodule]
-
-                    if not feat_mask.any():
-                        continue
+                    circuit_mask = ablation_masks[submodule]
 
                     x = submodule.get_activation()
                     x_hat, f = dictionary(x, output_features=True)
                     res = x - x_hat
 
-                    # Use ellipsis to handle dynamic dimensions dynamically
-                    f[..., feat_mask] = 0.0
+                    ablate_mask = circuit_mask if complement else ~circuit_mask
+
+                    is_dense = hasattr(dictionary, 'dict_size') and hasattr(dictionary, 'd_model') and dictionary.dict_size == dictionary.d_model
+
+                    if is_dense:
+                        f_mean = f.mean(dim=0, keepdim=True).expand_as(f)
+                        f[..., ablate_mask] = f_mean[..., ablate_mask]
+                    else:
+                        f[..., ablate_mask] = 0.0
+
+                    if not complement and not is_dense:
+                        res = t.zeros_like(res)
 
                     submodule.set_activation(dictionary.decode(f) + res)
 
@@ -101,22 +117,12 @@ def evaluate_with_ablations(text_batches, model, submodules, dictionaries, ablat
             yield final_logits.value, fac_ids, syc_ids
             pbar.update(1)
 
-
-def calculate_sycophancy_score(logits_diffs):
-    """
-    Calculates the percentage of times the model prefers the sycophantic token over the factual token.
-    """
-    diffs = t.cat(logits_diffs)
-    sycophantic_choices = (diffs > 0).float()
-    return sycophantic_choices.mean().item() * 100
-
-
-def run_evaluation(model, dataloader, submodules, dictionaries, ablation_masks, tracer_kwargs):
+def run_evaluation(model, dataloader, submodules, dictionaries, ablation_masks, tracer_kwargs, batch_size=4, complement=False):
     """
     Runs evaluation on the test set, comparing clean performance vs ablated performance.
     """
     print("\n--- Running Final Evaluation ---")
-    test_batches = dataloader.get_text_batches(split="test", batch_size=8)
+    test_batches = dataloader.get_text_batches(split="test", batch_size=batch_size)
 
     clean_diffs = []
     print("Evaluating Clean Model...")
@@ -126,8 +132,7 @@ def run_evaluation(model, dataloader, submodules, dictionaries, ablation_masks, 
                 final_logits = model.lm_head.output[:, -1, :].save()
 
             logits_val = final_logits.value
-            batch_indices = t.arange(
-                logits_val.size(0), device=logits_val.device)
+            batch_indices = t.arange(logits_val.size(0), device=logits_val.device)
             syc_logits = logits_val[batch_indices, syc_ids]
             fac_logits = logits_val[batch_indices, fac_ids]
             clean_diffs.append((syc_logits - fac_logits).cpu())
@@ -136,13 +141,14 @@ def run_evaluation(model, dataloader, submodules, dictionaries, ablation_masks, 
 
     print("Evaluating Ablated Model...")
     ablated_diffs = []
+    
     ablated_generator = evaluate_with_ablations(
-        test_batches, model, submodules, dictionaries, ablation_masks, tracer_kwargs
+        test_batches, model, submodules, dictionaries, ablation_masks, tracer_kwargs, 
+        complement=complement
     )
 
     for final_logits_val, fac_ids, syc_ids in ablated_generator:
-        batch_indices = t.arange(final_logits_val.size(
-            0), device=final_logits_val.device)
+        batch_indices = t.arange(final_logits_val.size(0), device=final_logits_val.device)
         syc_logits = final_logits_val[batch_indices, syc_ids]
         fac_logits = final_logits_val[batch_indices, fac_ids]
         ablated_diffs.append((syc_logits - fac_logits).cpu())
@@ -151,13 +157,12 @@ def run_evaluation(model, dataloader, submodules, dictionaries, ablation_masks, 
 
     print("\n" + "="*50)
     print("FINAL RESULTS")
-    print(f"Sycophancy Rate (Clean):   {clean_score:.2f}%")
-    print(f"Sycophancy Rate (Ablated): {ablated_score:.2f}%")
-    print(f"Absolute Reduction:        {clean_score - ablated_score:.2f}%")
+    print(f"Logit Diff (Clean):   {clean_score:.4f}")
+    print(f"Logit Diff (Ablated): {ablated_score:.4f}")
+    print(f"Absolute Reduction:   {clean_score - ablated_score:.4f}")
     print("="*50)
 
     return clean_score, ablated_score
-
 
 def save_extracted_features_to_json(global_aggregated_effects, output_path, min_threshold=0.0, global_mean_activations=None):
     """
