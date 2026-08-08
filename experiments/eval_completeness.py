@@ -96,12 +96,16 @@ def main():
     args = parser.parse_args()
 
     sfc_file = Path(args.effects_dir) / f"global_completeness_sfc_{args.experiment_name}.json"
-    dense_file = Path(args.effects_dir) / f"global_completeness_dense_{args.experiment_name}.json"
-
     if not sfc_file.exists():
-         sfc_file = Path(f"global_completeness_sfc_{args.experiment_name}.json")
+        sfc_file = Path(args.effects_dir) / f"sfc_completeness_results_{args.experiment_name}.json"
+    if not sfc_file.exists():
+        sfc_file = Path(f"global_completeness_sfc_{args.experiment_name}.json")
+
+    dense_file = Path(args.effects_dir) / f"global_completeness_dense_{args.experiment_name}.json"
     if not dense_file.exists():
-         dense_file = Path(f"global_completeness_dense_{args.experiment_name}.json")
+        dense_file = Path(args.effects_dir) / f"dense_completeness_results_{args.experiment_name}.json"
+    if not dense_file.exists():
+        dense_file = Path(f"global_completeness_dense_{args.experiment_name}.json")
 
     print(f"Loading results for experiment: {args.experiment_name}")
     

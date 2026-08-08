@@ -79,10 +79,16 @@ def main():
     args = parser.parse_args()
 
     sfc_file = Path(args.effects_dir) / f"global_faithfulness_sfc_{args.experiment_name}.json"
-    dense_file = Path(args.effects_dir) / f"global_faithfulness_dense_{args.experiment_name}.json"
+    if not sfc_file.exists():
+        sfc_file = Path(args.effects_dir) / f"sfc_faithfulness_results_{args.experiment_name}.json"
+    if not sfc_file.exists():
+        sfc_file = Path(f"global_faithfulness_sfc_{args.experiment_name}.json")
 
-    if not sfc_file.exists(): sfc_file = Path(f"global_faithfulness_sfc_{args.experiment_name}.json")
-    if not dense_file.exists(): dense_file = Path(f"global_faithfulness_dense_{args.experiment_name}.json")
+    dense_file = Path(args.effects_dir) / f"global_faithfulness_dense_{args.experiment_name}.json"
+    if not dense_file.exists():
+        dense_file = Path(args.effects_dir) / f"dense_faithfulness_results_{args.experiment_name}.json"
+    if not dense_file.exists():
+        dense_file = Path(f"global_faithfulness_dense_{args.experiment_name}.json")
     
     x_sfc, y_sfc, clean_score_sfc, empty_sfc = [], [], None, 0.5
     if sfc_file.exists():
