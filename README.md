@@ -7,9 +7,8 @@
 [![License MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Cambridge L193 Project](https://img.shields.io/badge/University%20of%20Cambridge-L193%20XAI-cyan.svg)](https://www.cl.cam.ac.uk/)
 
-> **Author**: Yifei Shi (`ys690@cam.ac.uk`) — Department of Computer Science and Technology, University of Cambridge  
+> **Institute**: Department of Computer Science and Technology, University of Cambridge  
 > **Course / Report**: L193 Explainable AI Project Report  
-> **Supervisors & Organizers**: Prof. Mateja Jamnik, Mateo Espinosa Zarlenga, Dr. Zohreh Shams
 
 ---
 
